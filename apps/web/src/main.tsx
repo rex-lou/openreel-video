@@ -6,6 +6,11 @@ import App from "./App";
 import "./index.css";
 import { registerServiceWorker } from "./services/service-worker";
 import { initCustomFonts } from "./components/editor/inspector/font-options";
+import { initLumioBridge } from "./lumio-bridge";
+
+// LUMIO 嵌入桥接 —— 检测 ?videos= ?theme= 等 URL 参数,自动加载视频到 timeline、
+// 应用主题、监听父窗口 postMessage。不在 iframe 且无 LUMIO 参数时静默不动。
+initLumioBridge();
 
 const POSTHOG_KEY = import.meta.env.VITE_PUBLIC_POSTHOG_KEY;
 const POSTHOG_HOST = import.meta.env.VITE_PUBLIC_POSTHOG_HOST;
