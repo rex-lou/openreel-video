@@ -78,6 +78,16 @@ async function urlToFile(url: string): Promise<File> {
 async function autoLoadVideos(urls: string[]): Promise<void> {
   if (urls.length === 0) return;
 
+  // 跳过 welcome 屏 —— 强制 hash 到 #/editor。否则 welcome 屏的 useEffect
+  // 可能在我们 createNewProject 之后再 createNewProject 一次(走 Vertical preset 流程),
+  // 把我们 import 的 media 整个覆盖掉。
+  if (window.location.hash !== '#/editor' && window.location.hash !== '#/editor/') {
+    window.location.hash = '#/editor';
+  }
+
+  // 等 React mount + 路由 useEffect 跑完 —— 200ms 经验值,够 React 18 commit 一轮。
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
   const project = useProjectStore.getState();
   project.createNewProject('LUMIO Edit', {
     width: 1920,
@@ -86,8 +96,8 @@ async function autoLoadVideos(urls: string[]): Promise<void> {
   });
 
   // createNewProject 是同步 setState,但 actionExecutor 内部初始化可能异步 ——
-  // 等一帧确保 store 完全就绪。
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  // 再等一帧确保 store 完全就绪。
+  await new Promise((resolve) => setTimeout(resolve, 200));
 
   let loaded = 0;
   let failed = 0;
