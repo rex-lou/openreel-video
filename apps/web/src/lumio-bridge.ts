@@ -70,10 +70,10 @@ async function urlToFile(url: string): Promise<File> {
 
 /**
  * 自动从 LUMIO 传来的 ?videos= URL 加载视频:
- * 1. 创建新项目(给个像样的名字)
- * 2. 逐个 fetch → importMedia → addClipToNewTrack
- *    addClipToNewTrack 不传 startTime 时,openreel 自动接 timeline 尾部 ——
- *    所以多个视频会顺序排在 timeline 上,无需手动计算偏移。
+ * 1. 创建新项目
+ * 2. 第一个视频:addClipToNewTrack 建一条 video track + 加 clip 在 t=0
+ *    后续视频:addClip(trackId, mediaId, acc) 都加到同一 track,acc 累加 duration
+ *    这样视觉上是 CapCut 风格 —— 一条 track 多个 clip 顺序串联,而不是多条 track 平行
  */
 async function autoLoadVideos(urls: string[]): Promise<void> {
   if (urls.length === 0) return;
@@ -91,6 +91,9 @@ async function autoLoadVideos(urls: string[]): Promise<void> {
 
   let loaded = 0;
   let failed = 0;
+  let trackId: string | null = null;
+  let acc = 0;
+
   for (const url of urls) {
     try {
       const file = await urlToFile(url);
@@ -101,14 +104,34 @@ async function autoLoadVideos(urls: string[]): Promise<void> {
         failed++;
         continue;
       }
-      // actionId 在 importMedia 里就是 newMediaItem.id
       const mediaId = importRes.actionId;
-      const addRes = await useProjectStore.getState().addClipToNewTrack(mediaId);
-      if (!addRes.success) {
-        console.warn(TAG, 'addClipToNewTrack failed', mediaId, addRes.error);
-        failed++;
-        continue;
+      const mediaItem = useProjectStore.getState().getMediaItem(mediaId);
+      const duration = mediaItem?.metadata.duration ?? 0;
+
+      if (trackId === null) {
+        // 第一段:建 video track + 加 clip @ t=0
+        const r = await proj.addClipToNewTrack(mediaId, 0);
+        if (!r.success) {
+          console.warn(TAG, 'addClipToNewTrack failed', mediaId, r.error);
+          failed++;
+          continue;
+        }
+        // 在 store 里找出刚建的 track —— 它是含有这个 mediaId 的 video track
+        const tracks = useProjectStore.getState().project.timeline.tracks;
+        const created = [...tracks].reverse().find(
+          (t) => t.type === 'video' && t.clips.some((c) => c.mediaId === mediaId),
+        );
+        trackId = created?.id ?? null;
+      } else {
+        // 后续:加到同一 track,startTime = 累加的总长
+        const r = await useProjectStore.getState().addClip(trackId, mediaId, acc);
+        if (!r.success) {
+          console.warn(TAG, 'addClip failed', mediaId, r.error);
+          failed++;
+          continue;
+        }
       }
+      acc += duration;
       loaded++;
     } catch (e) {
       console.warn(TAG, 'load failed', url, e);
