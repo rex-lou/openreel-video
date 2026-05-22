@@ -37,6 +37,7 @@ import {
   type TimeEstimate,
 } from "@openreel/core";
 import { ExportDialog } from "./ExportDialog";
+import { handleLumioExport } from "../../lumio-bridge";
 import { ScreenRecorder } from "./ScreenRecorder";
 import { HistoryPanel } from "./inspector/HistoryPanel";
 import { ProjectSwitcher } from "./ProjectSwitcher";
@@ -249,6 +250,8 @@ export const Toolbar: React.FC = () => {
 
     const triggerDownload = () => {
       const blob = new Blob([buffer.slice(0, length)], { type: mime });
+      // LUMIO 嵌入模式:把 blob 转发给父窗口让 LUMIO 上传 R2,不本地下载
+      if (handleLumioExport(blob, filename, mime)) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

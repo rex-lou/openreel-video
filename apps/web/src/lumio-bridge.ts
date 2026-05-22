@@ -143,6 +143,32 @@ async function autoLoadVideos(urls: string[]): Promise<void> {
   console.log(TAG, `videos loaded: ${loaded}/${urls.length} (${failed} failed)`);
 }
 
+/**
+ * 由 Toolbar.tsx 的 triggerDownload 调:把导出生成的 blob 通过 postMessage
+ * 传给 LUMIO 父窗口,绕过 iframe 内的 <a download> 触发(跨源 iframe download 体验差)。
+ * - 返回 true:已劫持,调用方不要再走本地下载
+ * - 返回 false:不在 LUMIO 模式 / parent 缺失,调用方继续走本地下载
+ *
+ * blob 通过 structured clone 跨 frame 传(Blob 是 transferable structured-cloneable),
+ * LUMIO 那侧 message handler 收到后立刻 fetch blob → 上传 R2 → 写 assets 表。
+ */
+let isLumioMode = false;
+export function handleLumioExport(blob: Blob, fileName: string, mimeType: string): boolean {
+  if (!isLumioMode || !window.parent || window.parent === window) return false;
+  try {
+    window.parent.postMessage(
+      { type: 'lumio:export-done', blob, fileName, mimeType, size: blob.size },
+      '*',
+    );
+    console.log(TAG, `export blob postMessage'd to parent: ${fileName} (${(blob.size/1024/1024).toFixed(2)} MB)`);
+    return true;
+  } catch (e) {
+    console.warn(TAG, 'export postMessage failed', e);
+    notifyParent({ type: 'lumio:bridge-error', message: `export forward failed: ${(e as Error).message}` });
+    return false;
+  }
+}
+
 /** parent → iframe postMessage 监听(主题切换等) */
 function installMessageListener(): void {
   window.addEventListener('message', (e) => {
@@ -181,7 +207,14 @@ export function initLumioBridge(): void {
     return;
   }
 
+  isLumioMode = true;
   console.log(TAG, 'init', { inIframe, hasLumioParams });
+
+  // 0. 拔掉 window.showSaveFilePicker —— 跨源 iframe 里调用它会 throw NotAllowedError,
+  //    让 Toolbar.tsx 的 `if ("showSaveFilePicker" in window)` 检测失败,自动走
+  //    in-memory writable fallback,最后 triggerDownload 时调 handleLumioExport
+  //    把 blob 转发给父窗口。
+  try { delete (window as { showSaveFilePicker?: unknown }).showSaveFilePicker; } catch { /* ignore */ }
 
   // 1. theme 立即应用(避免 dark→light 闪烁)
   const themeParam = params.get('theme');
