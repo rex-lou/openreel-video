@@ -596,7 +596,7 @@ export const Toolbar: React.FC = () => {
   ];
 
   return (
-    <div className="h-16 border-b border-border flex items-center px-6 justify-between bg-background shrink-0 z-30 relative">
+    <div className="h-16 border-b border-border flex items-center px-6 justify-between bg-background shrink-0 z-[110] relative">
       <div className="flex items-center gap-4">
         <Tooltip>
           <TooltipTrigger asChild>
