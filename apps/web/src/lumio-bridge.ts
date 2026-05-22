@@ -50,13 +50,30 @@ function notifyParent(payload: Record<string, unknown>): void {
   }
 }
 
-/** 从 URL ?videos= 拿 URL 数组(URL-decode + 过滤空) */
-function parseVideosParam(): string[] {
-  const raw = new URLSearchParams(window.location.search).get('videos');
+/** 从 URL ?media= (推荐) 或 ?videos= (向后兼容) 拿 URL 数组 */
+function parseMediaParam(): string[] {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('media') ?? params.get('videos');
   if (!raw) return [];
   return raw.split(',').map((s) => {
     try { return decodeURIComponent(s.trim()); } catch { return s.trim(); }
   }).filter(Boolean);
+}
+
+const EXT_MIME: Record<string, string> = {
+  // 视频
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', m4v: 'video/mp4',
+  // 图片
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
+  // 音频
+  mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', ogg: 'audio/ogg',
+};
+
+/** 根据 URL 扩展名 + fetch blob.type 推断 MIME,fallback video/mp4 */
+function inferMime(url: string, blobType: string): string {
+  if (blobType && blobType !== 'application/octet-stream') return blobType;
+  const ext = url.split('?')[0].split('.').pop()?.toLowerCase() ?? '';
+  return EXT_MIME[ext] ?? 'video/mp4';
 }
 
 /** 把单个 URL fetch 成 File 对象,失败 throw */
@@ -64,93 +81,135 @@ async function urlToFile(url: string): Promise<File> {
   const res = await fetch(url, { credentials: 'omit' });
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
   const blob = await res.blob();
-  const tail = (url.split('?')[0].split('/').pop() ?? 'video.mp4').slice(0, 80);
-  return new File([blob], tail, { type: blob.type || 'video/mp4' });
+  const mime = inferMime(url, blob.type);
+  const tailFromUrl = url.split('?')[0].split('/').pop() ?? '';
+  const hasExt = /\.[a-z0-9]{1,5}$/i.test(tailFromUrl);
+  const ext = mime.split('/')[1]?.replace('jpeg', 'jpg').replace('quicktime', 'mov') ?? 'mp4';
+  const tail = (hasExt ? tailFromUrl : `${tailFromUrl || 'media'}.${ext}`).slice(0, 80);
+  return new File([blob], tail, { type: mime });
 }
 
 /**
- * 自动从 LUMIO 传来的 ?videos= URL 加载视频:
- * 1. 创建新项目
- * 2. 第一个视频:addClipToNewTrack 建一条 video track + 加 clip 在 t=0
- *    后续视频:addClip(trackId, mediaId, acc) 都加到同一 track,acc 累加 duration
- *    这样视觉上是 CapCut 风格 —— 一条 track 多个 clip 顺序串联,而不是多条 track 平行
+ * 把一批 URL(video / image / audio 混合)加进 timeline:
+ * - 同类型连续的 media 共享一条 track(addClip 串联),累加 startTime
+ * - 类型切换时(video → image)自动新建一条 track(addClipToNewTrack)
+ * - image 在 store 里 metadata.duration 通常是 0,用 default IMAGE_DEFAULT_DUR 占时长
  */
-async function autoLoadVideos(urls: string[]): Promise<void> {
+const IMAGE_DEFAULT_DUR = 5;  // 静态图在 timeline 上默认占 5 秒
+
+interface LoadCtx {
+  videoTrackId: string | null;
+  videoAcc: number;
+  imageTrackId: string | null;
+  imageAcc: number;
+}
+
+async function addOneMedia(url: string, ctx: LoadCtx): Promise<boolean> {
+  const file = await urlToFile(url);
+  const proj = useProjectStore.getState();
+  const importRes = await proj.importMedia(file);
+  if (!importRes.success || !importRes.actionId) {
+    console.warn(TAG, 'importMedia failed', url, importRes.error);
+    return false;
+  }
+  const mediaId = importRes.actionId;
+  const mediaItem = useProjectStore.getState().getMediaItem(mediaId);
+  if (!mediaItem) return false;
+
+  const isImage = mediaItem.type === 'image';
+  const duration = isImage ? IMAGE_DEFAULT_DUR : (mediaItem.metadata.duration ?? 0);
+  const existingTrackId = isImage ? ctx.imageTrackId : ctx.videoTrackId;
+  const acc = isImage ? ctx.imageAcc : ctx.videoAcc;
+
+  if (existingTrackId === null) {
+    const r = await proj.addClipToNewTrack(mediaId, 0);
+    if (!r.success) {
+      console.warn(TAG, 'addClipToNewTrack failed', mediaId, r.error);
+      return false;
+    }
+    const tracks = useProjectStore.getState().project.timeline.tracks;
+    const created = [...tracks].reverse().find(
+      (t) => t.type === mediaItem.type && t.clips.some((c) => c.mediaId === mediaId),
+    );
+    const trackId = created?.id ?? null;
+    if (isImage) ctx.imageTrackId = trackId;
+    else ctx.videoTrackId = trackId;
+  } else {
+    const r = await useProjectStore.getState().addClip(existingTrackId, mediaId, acc);
+    if (!r.success) {
+      console.warn(TAG, 'addClip failed', mediaId, r.error);
+      return false;
+    }
+  }
+  if (isImage) ctx.imageAcc += duration;
+  else ctx.videoAcc += duration;
+  return true;
+}
+
+/**
+ * 初始加载(URL ?media= 传入)—— 必须先 createNewProject。
+ * 跳过 welcome 屏防 useEffect 重置我们的 project。
+ */
+async function autoLoadMedia(urls: string[]): Promise<void> {
   if (urls.length === 0) return;
 
-  // 跳过 welcome 屏 —— 强制 hash 到 #/editor。否则 welcome 屏的 useEffect
-  // 可能在我们 createNewProject 之后再 createNewProject 一次(走 Vertical preset 流程),
-  // 把我们 import 的 media 整个覆盖掉。
   if (window.location.hash !== '#/editor' && window.location.hash !== '#/editor/') {
     window.location.hash = '#/editor';
   }
-
-  // 等 React mount + 路由 useEffect 跑完 —— 200ms 经验值,够 React 18 commit 一轮。
   await new Promise((resolve) => setTimeout(resolve, 200));
 
   const project = useProjectStore.getState();
-  project.createNewProject('LUMIO Edit', {
-    width: 1920,
-    height: 1080,
-    frameRate: 30,
-  });
-
-  // createNewProject 是同步 setState,但 actionExecutor 内部初始化可能异步 ——
-  // 再等一帧确保 store 完全就绪。
+  project.createNewProject('LUMIO Edit', { width: 1920, height: 1080, frameRate: 30 });
   await new Promise((resolve) => setTimeout(resolve, 200));
 
+  const ctx: LoadCtx = { videoTrackId: null, videoAcc: 0, imageTrackId: null, imageAcc: 0 };
   let loaded = 0;
   let failed = 0;
-  let trackId: string | null = null;
-  let acc = 0;
-
   for (const url of urls) {
     try {
-      const file = await urlToFile(url);
-      const proj = useProjectStore.getState();
-      const importRes = await proj.importMedia(file);
-      if (!importRes.success || !importRes.actionId) {
-        console.warn(TAG, 'importMedia failed', url, importRes.error);
-        failed++;
-        continue;
-      }
-      const mediaId = importRes.actionId;
-      const mediaItem = useProjectStore.getState().getMediaItem(mediaId);
-      const duration = mediaItem?.metadata.duration ?? 0;
-
-      if (trackId === null) {
-        // 第一段:建 video track + 加 clip @ t=0
-        const r = await proj.addClipToNewTrack(mediaId, 0);
-        if (!r.success) {
-          console.warn(TAG, 'addClipToNewTrack failed', mediaId, r.error);
-          failed++;
-          continue;
-        }
-        // 在 store 里找出刚建的 track —— 它是含有这个 mediaId 的 video track
-        const tracks = useProjectStore.getState().project.timeline.tracks;
-        const created = [...tracks].reverse().find(
-          (t) => t.type === 'video' && t.clips.some((c) => c.mediaId === mediaId),
-        );
-        trackId = created?.id ?? null;
-      } else {
-        // 后续:加到同一 track,startTime = 累加的总长
-        const r = await useProjectStore.getState().addClip(trackId, mediaId, acc);
-        if (!r.success) {
-          console.warn(TAG, 'addClip failed', mediaId, r.error);
-          failed++;
-          continue;
-        }
-      }
-      acc += duration;
-      loaded++;
+      if (await addOneMedia(url, ctx)) loaded++;
+      else failed++;
     } catch (e) {
       console.warn(TAG, 'load failed', url, e);
       failed++;
     }
   }
+  notifyParent({ type: 'lumio:media-loaded', count: loaded, failed });
+  console.log(TAG, `media loaded: ${loaded}/${urls.length} (${failed} failed)`);
+}
 
-  notifyParent({ type: 'lumio:videos-loaded', count: loaded, failed });
-  console.log(TAG, `videos loaded: ${loaded}/${urls.length} (${failed} failed)`);
+/**
+ * 增量加载(LUMIO postMessage 推送)—— 项目已经存在,继续往现有 track 加。
+ * 复用 LoadCtx 让 video / image 各自的串联状态延续(每次新调用都重新扫一次现有 timeline
+ * 确定 trackId / acc,这样支持用户在 LUMIO 多次 picker 加视频)。
+ */
+async function appendMedia(urls: string[]): Promise<void> {
+  if (urls.length === 0) return;
+  const tracks = useProjectStore.getState().project?.timeline?.tracks ?? [];
+  // 找现有最新的 video / image track + 它们的当前总长(用于新 clip 的 startTime)
+  const calcAcc = (t: { clips: { startTime: number; duration: number }[] }) =>
+    t.clips.reduce((m, c) => Math.max(m, c.startTime + c.duration), 0);
+  const lastVideoTrack = [...tracks].reverse().find((t) => t.type === 'video');
+  const lastImageTrack = [...tracks].reverse().find((t) => t.type === 'image');
+  const ctx: LoadCtx = {
+    videoTrackId: lastVideoTrack?.id ?? null,
+    videoAcc: lastVideoTrack ? calcAcc(lastVideoTrack) : 0,
+    imageTrackId: lastImageTrack?.id ?? null,
+    imageAcc: lastImageTrack ? calcAcc(lastImageTrack) : 0,
+  };
+  let loaded = 0;
+  let failed = 0;
+  for (const url of urls) {
+    try {
+      if (await addOneMedia(url, ctx)) loaded++;
+      else failed++;
+    } catch (e) {
+      console.warn(TAG, 'append failed', url, e);
+      failed++;
+    }
+  }
+  notifyParent({ type: 'lumio:media-appended', count: loaded, failed });
+  console.log(TAG, `media appended: ${loaded}/${urls.length} (${failed} failed)`);
 }
 
 /**
@@ -191,6 +250,12 @@ function installMessageListener(): void {
         if (t === 'dark' || t === 'light' || t === 'auto') {
           useThemeStore.getState().setMode(t as ThemeMode);
         }
+        break;
+      }
+      case 'lumio:add-media': {
+        // LUMIO picker 选完资产后推过来,增量加到当前 timeline
+        const urls = Array.isArray(data.urls) ? data.urls.filter((u: unknown): u is string => typeof u === 'string') : [];
+        if (urls.length > 0) void appendMedia(urls);
         break;
       }
       default:
@@ -245,15 +310,15 @@ export function initLumioBridge(): void {
   // 3. 等页面 load 完成后自动加载 videos
   //    用 load 而非 DOMContentLoaded —— openreel App.tsx 启动时 useRouter 解析 hash
   //    决定显示 welcome / editor,要在它走完一轮后再操作 store 才稳。
-  const videos = parseVideosParam();
-  if (videos.length > 0) {
+  const initial = parseMediaParam();
+  if (initial.length > 0) {
     if (document.readyState === 'complete') {
       // 已经 loaded,等一帧让 React mount
-      setTimeout(() => { void autoLoadVideos(videos); }, 0);
+      setTimeout(() => { void autoLoadMedia(initial); }, 0);
     } else {
       window.addEventListener('load', () => {
         // 再等 100ms 让 React 完成首渲染 + welcome 屏初始化
-        setTimeout(() => { void autoLoadVideos(videos); }, 100);
+        setTimeout(() => { void autoLoadMedia(initial); }, 100);
       }, { once: true });
     }
   }
